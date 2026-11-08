@@ -136,12 +136,12 @@ jobs:
       contents: read
     steps:
       - name: Check out this repository (smoke test)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: ops
           persist-credentials: false
       - name: Check out upstream at the tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ env.UPSTREAM }}
           ref: refs/tags/${{ needs.detect.outputs.tag }}
@@ -154,7 +154,7 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$COMMIT" || { echo "::error::checked out $(git rev-parse HEAD), want $COMMIT"; exit 1; }
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: src/go.mod
           cache: false
@@ -162,7 +162,7 @@ jobs:
         working-directory: src
         run: bash .github/scripts/refresh-model-catalogs.sh
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Build linux/amd64
         working-directory: src
         env:
@@ -188,7 +188,7 @@ jobs:
         env:
           TAG: ${{ needs.detect.outputs.tag }}
         run: docker save "cpa-candidate:$TAG" | gzip -1 > image.tar.gz
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: image
           path: image.tar.gz
@@ -197,12 +197,17 @@ jobs:
   publish:
     needs: [detect, build]
     runs-on: ubuntu-latest
-    # Executes no upstream code: loads the tested image and pushes it.
+    # Executes no upstream code: loads the tested image and pushes it. To
+    # require a person's approval before anything is published, add
+    # required reviewers to the "publish" environment (Settings ->
+    # Environments).
+    environment: publish
     permissions:
-      contents: write
       packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: image
       - name: Push
@@ -223,17 +228,27 @@ jobs:
             exit 1
           fi
           docker buildx imagetools inspect "$IMAGE@$digest" >/dev/null
+          docker logout ghcr.io
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Published \`$IMAGE:$TAG\` = \`$IMAGE@$digest\`" >> "$GITHUB_STEP_SUMMARY"
+
+  record:
+    needs: [detect, publish]
+    runs-on: ubuntu-latest
+    # Writes images.json on the nayhap-images branch; no package access.
+    permissions:
+      contents: write
+    steps:
       - name: Record the digest
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.detect.outputs.tag }}
           COMMIT: ${{ needs.detect.outputs.commit }}
-          DIGEST: ${{ steps.push.outputs.digest }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          printf '%s' "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "::error::bad digest"; exit 1; }
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
