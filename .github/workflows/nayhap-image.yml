@@ -1,0 +1,264 @@
+# Nayhap: build, smoke-test and publish the CLI Proxy API image that
+# Environments runs for hosted proxy instances.
+#
+# On a schedule (and by hand) this workflow
+#   1. finds the latest stable upstream release of router-for-me/CLIProxyAPI,
+#   2. syncs this fork (main via GitHub's merge-upstream, the release tag as
+#      a ref), best effort,
+#   3. builds the release's own Dockerfile for linux/amd64 from the exact
+#      upstream tag, in a job that holds no write credentials,
+#   4. smoke-tests the image the way the hosted-CPA broker runs it
+#      (.github/nayhap/smoke.sh),
+#   5. pushes ghcr.io/nayhap/cli-proxy-api:<tag> and records its digest in
+#      images.json on the nayhap-images branch, which Environments' bump
+#      workflow reads.
+#
+# No source patches: the image is upstream's code at the tag. A tag that was
+# already published is skipped; a tag that moved to another commit fails.
+name: nayhap-image
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (default: the latest stable release)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if the tag was already published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nayhap-image
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: router-for-me/CLIProxyAPI
+  IMAGE: ghcr.io/nayhap/cli-proxy-api
+  RECORD_BRANCH: nayhap-images
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      commit: ${{ steps.pick.outputs.commit }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - name: Pick the release to build
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-}"
+          if [ -z "$tag" ]; then
+            tag="$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)"
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::not a stable release tag: $tag"
+            exit 1
+          fi
+          # The commit the tag points at (peeled when annotated).
+          commit="$(git ls-remote "https://github.com/$UPSTREAM.git" "refs/tags/$tag^{}" | cut -f1)"
+          if [ -z "$commit" ]; then
+            commit="$(git ls-remote "https://github.com/$UPSTREAM.git" "refs/tags/$tag" | cut -f1)"
+          fi
+          if ! printf '%s' "$commit" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::cannot resolve $tag upstream"
+            exit 1
+          fi
+          build=true
+          if record="$(gh api "repos/$GITHUB_REPOSITORY/contents/images.json?ref=$RECORD_BRANCH" --jq .content 2>/dev/null | base64 -d)"; then
+            seen="$(printf '%s' "$record" | jq -r --arg t "$tag" '.images[$t].upstream_commit // ""')"
+            if [ -n "$seen" ] && [ "$seen" != "$commit" ]; then
+              echo "::error::upstream tag $tag moved from $seen to $commit; refusing to publish it again"
+              exit 1
+            fi
+            if [ -n "$seen" ] && [ "$FORCE" != "true" ]; then
+              build=false
+              echo "$tag ($commit) is already published"
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "Upstream $tag at $commit; build: $build" >> "$GITHUB_STEP_SUMMARY"
+
+  sync:
+    needs: detect
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Best effort: GitHub refuses ref updates that change workflow files
+      # when made with the workflow token, so a fork sync that brings upstream
+      # workflow changes needs a maintainer's "Sync fork" click. Builds do not
+      # depend on it; they fetch the tag from upstream directly.
+      - name: Sync main with upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if out="$(gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=main 2>&1)"; then
+            echo "main: $out"
+          else
+            echo "::warning::could not sync main with upstream: $out"
+          fi
+      - name: Mirror the release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          COMMIT: ${{ needs.detect.outputs.commit }}
+        run: |
+          if have="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null)"; then
+            echo "tag $TAG already mirrored ($have)"
+          elif out="$(gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$COMMIT" 2>&1)"; then
+            echo "mirrored $TAG -> $COMMIT"
+          else
+            echo "::warning::could not mirror tag $TAG: $out"
+          fi
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    # Runs upstream code (the catalog refresh and the image build): no write
+    # permissions here.
+    permissions:
+      contents: read
+    steps:
+      - name: Check out this repository (smoke test)
+        uses: actions/checkout@v4
+        with:
+          path: ops
+          persist-credentials: false
+      - name: Check out upstream at the tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: refs/tags/${{ needs.detect.outputs.tag }}
+          path: src
+          persist-credentials: false
+      - name: Verify the tag's commit
+        working-directory: src
+        env:
+          COMMIT: ${{ needs.detect.outputs.commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$COMMIT" || { echo "::error::checked out $(git rev-parse HEAD), want $COMMIT"; exit 1; }
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache: false
+      - name: Refresh model catalogs (as upstream's release build does)
+        working-directory: src
+        run: bash .github/scripts/refresh-model-catalogs.sh
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build linux/amd64
+        working-directory: src
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+          COMMIT: ${{ needs.detect.outputs.commit }}
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64 --load \
+            --build-arg "VERSION=$TAG" \
+            --build-arg "COMMIT=${COMMIT:0:7}" \
+            --build-arg "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$TAG" \
+            --label "org.opencontainers.image.revision=$COMMIT" \
+            --label "org.opencontainers.image.licenses=MIT" \
+            --label "org.opencontainers.image.description=CLI Proxy API $TAG (upstream router-for-me/CLIProxyAPI, unmodified) for Nayhap Environments hosted proxies" \
+            -t "cpa-candidate:$TAG" .
+      - name: Smoke test
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: bash ops/.github/nayhap/smoke.sh "cpa-candidate:$TAG"
+      - name: Save the image
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: docker save "cpa-candidate:$TAG" | gzip -1 > image.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 3
+
+  publish:
+    needs: [detect, build]
+    runs-on: ubuntu-latest
+    # Executes no upstream code: loads the tested image and pushes it.
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+      - name: Push
+        id: push
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gunzip -c image.tar.gz | docker load
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag "cpa-candidate:$TAG" "$IMAGE:$TAG"
+          docker push "$IMAGE:$TAG"
+          ref="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$TAG")"
+          digest="${ref#*@}"
+          if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::unexpected digest $ref"
+            exit 1
+          fi
+          docker buildx imagetools inspect "$IMAGE@$digest" >/dev/null
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Published \`$IMAGE:$TAG\` = \`$IMAGE@$digest\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Record the digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          COMMIT: ${{ needs.detect.outputs.commit }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          for attempt in 1 2 3; do
+            rm -rf rec && mkdir rec && cd rec && git init -q
+            if git fetch -q --depth 1 "$url" "$RECORD_BRANCH" 2>/dev/null; then
+              git checkout -q -B "$RECORD_BRANCH" FETCH_HEAD
+            else
+              git checkout -q --orphan "$RECORD_BRANCH"
+              echo '{"latest":"","images":{}}' > images.json
+              printf '# Nayhap CLI Proxy API images\n\nimages.json lists every published image of ghcr.io/nayhap/cli-proxy-api by upstream tag, with its digest. Written by .github/workflows/nayhap-image.yml on main.\n' > README.md
+            fi
+            now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            latest="$(jq -r '.latest // ""' images.json)"
+            newest="$(printf '%s\n%s\n' "$latest" "$TAG" | sed '/^$/d' | sort -V | tail -n1)"
+            jq --arg t "$TAG" --arg c "$COMMIT" --arg d "$DIGEST" --arg i "$IMAGE" --arg n "$now" --arg r "$RUN_URL" --arg l "$newest" \
+              '.latest = $l | .images[$t] = {tag: $t, image: $i, digest: $d, ref: ($i + "@" + $d), upstream_commit: $c, built_at: $n, run: $r}' \
+              images.json > images.json.new && mv images.json.new images.json
+            git add images.json README.md 2>/dev/null || git add images.json
+            git commit -q -m "Publish $TAG ($DIGEST)"
+            if git push -q "$url" "HEAD:refs/heads/$RECORD_BRANCH"; then
+              echo "recorded $TAG"
+              exit 0
+            fi
+            cd .. && sleep $((attempt * 5))
+          done
+          echo "::error::could not record $TAG"
+          exit 1
