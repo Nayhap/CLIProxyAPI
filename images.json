@@ -1,5 +1,5 @@
 {
-  "latest": "v8.0.77",
+  "latest": "v8.0.78",
   "images": {
     "v8.0.61": {
       "tag": "v8.0.61",
@@ -126,6 +126,15 @@
       "upstream_commit": "a5e8f69e56309e1ef6d6872e667da81fdfbce2ce",
       "built_at": "2026-11-18T07:29:45Z",
       "run": "https://github.com/Nayhap/CLIProxyAPI/actions/runs/44258959592"
+    },
+    "v8.0.78": {
+      "tag": "v8.0.78",
+      "image": "ghcr.io/nayhap/cli-proxy-api",
+      "digest": "sha256:f931c71fcaf5637750c12123245a900efbc912bdae17207da2a45e3d6780d637",
+      "ref": "ghcr.io/nayhap/cli-proxy-api@sha256:f931c71fcaf5637750c12123245a900efbc912bdae17207da2a45e3d6780d637",
+      "upstream_commit": "db7f177d6b0e51eb237daed718de4d25e7a893f5",
+      "built_at": "2026-11-19T07:27:31Z",
+      "run": "https://github.com/Nayhap/CLIProxyAPI/actions/runs/44479327161"
     }
   }
 }
